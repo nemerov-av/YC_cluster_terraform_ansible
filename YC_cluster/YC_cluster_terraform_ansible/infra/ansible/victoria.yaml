@@ -1,0 +1,111 @@
+---
+- name: Migrate Prometheus to VictoriaMetrics and Configure Monitoring
+  hosts: monitoring_servers
+  become: yes
+  vars:
+    vm_version: "1.104.0"
+    vm_binary_url: "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v{{ vm_version }}/victoria-metrics-linux-amd64-v{{ vm_version }}.tar.gz"
+    vmutils_url: "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v{{ vm_version }}/vmutils-linux-amd64-v{{ vm_version }}.tar.gz"
+    prometheus_config: "/etc/prometheus/prometheus.yml"     # Путь к конфигурации Prometheus[cite: 3, 4]
+    prometheus_data_dir: "/var/lib/prometheus/"            # Путь к хранилищу Prometheus[cite: 3]
+    vm_data_dir: "/var/lib/victoria-metrics"
+
+  tasks:
+    # ==============================================================================
+    # 1. Установка VictoriaMetrics и утилит (vmctl)
+    # ==============================================================================
+    - name: Download VictoriaMetrics binary
+      get_url:
+        url: "{{ vm_binary_url }}"
+        dest: "/tmp/victoria-metrics.tar.gz"
+
+    - name: Unarchive VictoriaMetrics
+      unarchive:
+        src: "/tmp/victoria-metrics.tar.gz"
+        dest: "/usr/local/bin/"
+        remote_src: yes
+
+    - name: Download vmutils (for vmctl-prod)
+      get_url:
+        url: "{{ vmutils_url }}"
+        dest: "/tmp/vmutils.tar.gz"
+
+    - name: Unarchive vmutils
+      unarchive:
+        src: "/tmp/vmutils.tar.gz"
+        dest: "/usr/local/bin/"
+        remote_src: yes
+
+    # ==============================================================================
+    # 2. Увеличение интервала сбора метрик до 90 секунд
+    # ==============================================================================
+    - name: Update scrape_interval to 90s in prometheus.yml
+      lineinfile:
+        path: "{{ prometheus_config }}"
+        regexp: 'scrape_interval:.*'
+        line: '  scrape_interval: 90s'
+
+    # ==============================================================================
+    # 3. Создание снимка (snapshot) и миграция данных
+    # ==============================================================================
+    - name: Ensure Prometheus is running for snapshot creation
+      systemd:
+        name: prometheus
+        state: started
+
+    - name: Create Prometheus snapshot via Admin API
+      uri:
+        url: "http://localhost:9090/api/v1/admin/tsdb/snapshot"
+        method: POST
+      register: prom_snapshot_result
+
+    - name: Find the latest snapshot directory path
+      shell: |
+        ls -dt /var/lib/prometheus/snapshots/*/ | head -n 1
+      register: snapshot_dir
+
+    - name: Stop Prometheus after snapshot creation
+      systemd:
+        name: prometheus
+        state: stopped
+
+    # ==============================================================================
+    # 4. Настройка и запуск VictoriaMetrics вместо Prometheus
+    # ==============================================================================
+    - name: Create VictoriaMetrics systemd service
+      copy:
+        dest: /etc/systemd/system/victoria-metrics.service
+        content: |
+          [Unit]
+          Description=VictoriaMetrics
+          After=network-online.target
+
+          [Service]
+          User=root
+          ExecStart=/usr/local/bin/victoria-metrics-prod -storageDataPath={{ vm_data_dir }} -promscrape.config={{ prometheus_config }}
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Start VictoriaMetrics before migration
+      systemd:
+        name: victoria-metrics
+        enabled: yes
+        state: started
+
+    - name: Migrate data from Prometheus snapshot to VictoriaMetrics
+      command: "/usr/local/bin/vmctl-prod prometheus --prom-snapshot={{ snapshot_dir.stdout | trim }} --vm-addr=http://localhost:8428"
+
+    # ==============================================================================
+    # 5. Полное отключение старого Prometheus
+    # ==============================================================================
+    - name: Disable and stop Prometheus completely
+      systemd:
+        name: prometheus
+        enabled: no
+        state: stopped

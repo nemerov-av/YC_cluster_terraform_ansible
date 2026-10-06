@@ -1,0 +1,238 @@
+---
+- name: 1. Deploy Elasticsearch Cluster on 3 Nodes
+  hosts: elastic_nodes
+  become: yes
+  vars:
+    es_deb_url: "https://storage.yandexcloud.net/my-consul-releases-bucket-2026/elasticsearch-8.12.2-amd64.deb"
+    es_cluster_name: "my-elk-cluster"
+  tasks:
+    - name: Wait for apt locks to clear
+      shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          sleep 3
+        done
+      changed_when: false
+
+    - name: Download Elasticsearch .deb from S3
+      get_url:
+        url: "{{ es_deb_url }}"
+        dest: "/tmp/elasticsearch.deb"
+
+    - name: Install Elasticsearch
+      apt:
+        deb: "/tmp/elasticsearch.deb"
+        state: present
+
+    - name: Configure Elasticsearch JVM Heap (512m)
+      copy:
+        dest: /etc/elasticsearch/jvm.options.d/heap.options
+        content: |
+          -Xms512m
+          -Xmx512m
+        owner: root
+        group: elasticsearch
+        mode: "0644"
+
+    - name: Configure elasticsearch.yml
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: |
+          cluster.name: {{ es_cluster_name }}
+          node.name: {{ inventory_hostname }}
+          path.data: /var/lib/elasticsearch
+          path.logs: /var/log/elasticsearch
+          network.host: 0.0.0.0
+          discovery.seed_hosts:
+            - "{{ hostvars[groups['elastic_nodes'][0]]['ansible_host'] }}"
+            - "{{ hostvars[groups['elastic_nodes'][1]]['ansible_host'] }}"
+            - "{{ hostvars[groups['elastic_nodes'][2]]['ansible_host'] }}"
+          cluster.initial_master_nodes:
+            - "{{ hostvars[groups['elastic_nodes'][0]]['ansible_host'] }}"
+            - "{{ hostvars[groups['elastic_nodes'][1]]['ansible_host'] }}"
+            - "{{ hostvars[groups['elastic_nodes'][2]]['ansible_host'] }}"
+          xpack.security.enabled: false
+          xpack.security.http.ssl.enabled: false
+          xpack.security.transport.ssl.enabled: false
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+
+    - name: Enable and restart Elasticsearch
+      systemd:
+        name: elasticsearch
+        enabled: yes
+        state: restarted
+        daemon_reload: yes
+
+- name: 2. Deploy Kibana on Monitoring Server
+  hosts: kibana
+  become: yes
+  vars:
+    kibana_deb_url: "https://storage.yandexcloud.net/my-consul-releases-bucket-2026/kibana-8.12.2-amd64.deb"
+  tasks:
+    - name: Download Kibana .deb package from S3
+      get_url:
+        url: "{{ kibana_deb_url }}"
+        dest: "/tmp/kibana.deb"
+
+    - name: Install Kibana via apt
+      apt:
+        deb: "/tmp/kibana.deb"
+        state: present
+
+    - name: Configure kibana.yml
+      copy:
+        dest: /etc/kibana/kibana.yml
+        content: |
+          server.port: 5601
+          server.host: "0.0.0.0"
+          elasticsearch.hosts:
+            - "http://{{ hostvars[groups['elastic_nodes'][0]]['ansible_host'] }}:9200"
+            - "http://{{ hostvars[groups['elastic_nodes'][1]]['ansible_host'] }}:9200"
+            - "http://{{ hostvars[groups['elastic_nodes'][2]]['ansible_host'] }}:9200"
+        owner: root
+        group: kibana
+        mode: "0660"
+
+    - name: Enable and restart Kibana
+      systemd:
+        name: kibana
+        enabled: yes
+        state: restarted
+
+- name: 3. Deploy Filebeat on Log Clients
+  hosts: log_clients
+  become: yes
+  vars:
+    filebeat_deb_url: "https://storage.yandexcloud.net/my-consul-releases-bucket-2026/filebeat-8.12.2-amd64.deb"
+  tasks:
+    - name: Download Filebeat .deb from S3
+      get_url:
+        url: "{{ filebeat_deb_url }}"
+        dest: "/tmp/filebeat.deb"
+
+    - name: Install Filebeat
+      apt:
+        deb: "/tmp/filebeat.deb"
+        state: present
+
+    - name: Configure Filebeat
+      copy:
+        dest: /etc/filebeat/filebeat.yml
+        content: |
+          filebeat.inputs:
+          - type: filestream
+            id: system-logs
+            enabled: true
+            paths:
+              - /var/log/*.log
+
+          output.elasticsearch:
+            hosts: 
+              - "http://{{ hostvars[groups['elastic_nodes'][0]]['ansible_host'] }}:9200"
+              - "http://{{ hostvars[groups['elastic_nodes'][1]]['ansible_host'] }}:9200"
+              - "http://{{ hostvars[groups['elastic_nodes'][2]]['ansible_host'] }}:9200"
+        owner: root
+        mode: "0600"
+
+    - name: Enable and start Filebeat
+      systemd:
+        name: filebeat
+        enabled: yes
+        state: restarted
+
+- name: 4. Install and Configure Robust Index Cleanup (Replacing Curator)
+  hosts: kibana
+  become: yes
+  vars:
+    curator_venv: /opt/curator-venv
+    target_es_host: "http://{{ hostvars[groups['elastic_nodes'][0]]['ansible_host'] }}:9200"
+    retention_days: 14
+  tasks:
+    - name: Install Python, pip and venv
+      apt:
+        name: [python3, python3-pip, python3-venv]
+        state: present
+
+    - name: Create Python virtual environment for cleanup tool
+      command: python3 -m venv "{{ curator_venv }}"
+      args:
+        creates: "{{ curator_venv }}/bin/python"
+
+    - name: Install compatible elasticsearch python client inside venv
+      pip:
+        name: "elasticsearch<9"
+        executable: "{{ curator_venv }}/bin/pip"
+
+    - name: Create Curator config directory for reference
+      file:
+        path: /etc/curator
+        state: directory
+        mode: "0755"
+
+    - name: Deploy correct curator.yml configuration template
+      copy:
+        dest: /etc/curator/curator.yml
+        content: |
+          client:
+            hosts:
+              - "{{ target_es_host }}"
+            use_ssl: False
+            ssl_no_validate: True
+            timeout: 30
+            master_only: False
+          logging:
+            loglevel: INFO
+            logfile: /var/log/curator.log
+            logformat: default
+            blacklist: ['elasticsearch', 'urllib3']
+        mode: "0644"
+
+    - name: Deploy robust clean_indices.py script handling Data Streams
+      copy:
+        dest: "{{ curator_venv }}/clean_indices.py"
+        content: |
+          import logging
+          from datetime import datetime, timedelta
+          from elasticsearch import Elasticsearch
+
+          logging.basicConfig(
+              filename='/var/log/curator.log',
+              level=logging.INFO,
+              format='%(asctime)s %(levelname)-8s %(message)s'
+          )
+
+          try:
+              client = Elasticsearch("{{ target_es_host }}")
+              logging.info("ESTRAIN: Connected to Elasticsearch cluster.")
+              
+              # Получаем все индексы и дата-стримы filebeat
+              indices = client.indices.get(index="filebeat-*").keys()
+              logging.info(f"Found indices/datastream targets: {list(indices)}")
+              
+              cutoff_date = datetime.now() - timedelta(days={{ retention_days }})
+              
+              for index in indices:
+                  try:
+                      # Корректный поиск даты в имени (работает для .ds-filebeat-* и обычных индексов)
+                      date_str = index.split('-')[-1]
+                      if len(date_str) == 10 and date_str.count('.') == 2:
+                          idx_date = datetime.strptime(date_str, '%Y.%m.%d')
+                          if idx_date < cutoff_date:
+                              logging.info(f"Deleting old index/stream: {index}")
+                              client.indices.delete(index=index)
+                  except ValueError:
+                      continue
+                      
+              logging.info("Action 'delete_indices' completed successfully.")
+          except Exception as e:
+              logging.critical(f"Error encountered: {e}")
+        mode: "0755"
+
+    - name: Setup cron job for automated daily cleanup at 03:00 AM
+      cron:
+        name: "Run Elasticsearch Indices Cleanup Daily"
+        minute: "0"
+        hour: "3"
+        job: "{{ curator_venv }}/bin/python {{ curator_venv }}/clean_indices.py"
+        user: root

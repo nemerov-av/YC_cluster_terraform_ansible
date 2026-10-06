@@ -1,0 +1,93 @@
+---
+- name: Deploy SonarQube
+  hosts: monitoring-1
+  become: yes
+  vars:
+    domain_name: "sonarqube.вашдомен.ru"
+
+  tasks:
+    - name: Install Docker via APT
+      apt:
+        name:
+          - docker.io
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Ensure CLI plugins directory exists
+      file:
+        path: /usr/libexec/docker/cli-plugins
+        state: directory
+        mode: "0755"
+
+    - name: Download Docker Compose V2 binary
+      get_url:
+        url: "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64"
+        dest: /usr/libexec/docker/cli-plugins/docker-compose
+        mode: "0755"
+
+    - name: Create symlink for global docker-compose command
+      file:
+        src: /usr/libexec/docker/cli-plugins/docker-compose
+        dest: /usr/local/bin/docker-compose
+        state: link
+
+    - name: Ensure vm.max_map_count is set correctly for SonarQube
+      sysctl:
+        name: vm.max_map_count
+        value: "262144"
+        state: present
+        sysctl_set: yes
+
+    - name: Create directory for SonarQube
+      file:
+        path: /opt/sonarqube
+        state: directory
+        mode: "0755"
+
+    - name: Create docker-compose.yml for SonarQube
+      copy:
+        dest: /opt/sonarqube/docker-compose.yml
+        content: |
+          version: "3.8"
+          services:
+            sonarqube:
+              image: sonarqube:lts-community
+              container_name: sonarqube
+              depends_on:
+                - db
+              environment:
+                - SONAR_JDBC_URL=jdbc:postgresql://db:5432/sonar
+                - SONAR_JDBC_USERNAME=sonar
+                - SONAR_JDBC_PASSWORD=sonar_strong_password
+              volumes:
+                - sonarqube_data:/opt/sonarqube/data
+                - sonarqube_extensions:/opt/sonarqube/extensions
+                - sonarqube_logs:/opt/sonarqube/logs
+              ports:
+                - "9000:9000"
+              restart: unless-stopped
+
+            db:
+              image: postgres:13
+              container_name: sonarqube_db
+              environment:
+                - POSTGRES_USER=sonar
+                - POSTGRES_PASSWORD=sonar_strong_password
+                - POSTGRES_DB=sonar
+              volumes:
+                - postgresql:/var/lib/postgresql
+                - postgresql_data:/var/lib/postgresql/data
+              restart: unless-stopped
+
+          volumes:
+            sonarqube_data:
+            sonarqube_extensions:
+            sonarqube_logs:
+            postgresql:
+            postgresql_data:
+
+    - name: Start SonarQube via Docker Compose
+      command: docker compose up -d
+      args:
+        chdir: /opt/sonarqube

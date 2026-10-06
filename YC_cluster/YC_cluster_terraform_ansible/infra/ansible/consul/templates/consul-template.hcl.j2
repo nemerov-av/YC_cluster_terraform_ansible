@@ -1,0 +1,9 @@
+consul {
+  address = "127.0.0.1:8500"
+}
+
+template {
+  source      = "/etc/consul-template/templates/load-balancer.conf.ctmpl"
+  destination = "/etc/nginx/conf.d/load-balancer.conf"
+  command     = "systemctl reload nginx"
+}

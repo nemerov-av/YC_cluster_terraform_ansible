@@ -1,0 +1,79 @@
+
+- name: Подготовка хостов (установка пакетов и acl)
+  hosts: all
+  become: true
+  tasks:
+    - name: Установка acl и зависимостей
+      apt:
+        name:
+          - acl
+          - python3-pip
+          - python3-consul
+          - curl
+          - software-properties-common
+          - unzip
+        state: present
+        update_cache: yes
+
+- name: Развертывание HA-кластера Consul (Серверы)
+  hosts: consul_servers
+  become: true
+  vars:
+    consul_group_name: "consul_servers"
+    consul_node_role: "server"
+    consul_bootstrap_expect: 3
+    consul_datacenter: "dc1"
+    consul_bind_address: "{{ ansible_default_ipv4.address }}"
+  roles:
+    - role: ansible-consul
+
+- name: Развертывание Consul Клиентов (Backends и LB)
+  hosts: consul_clients
+  become: true
+  gather_facts: true
+  vars:
+    consul_group_name: "consul_servers"
+    consul_node_role: "client"
+    consul_datacenter: "dc1"
+    consul_encrypt_enable: true
+    consul_raw_key: "cijVdvz5f1bNy4RiR66WkgWYaN/KOVYw8x6NBXomHbg="
+    consul_join: "{{ groups['consul_servers'] | map('extract', hostvars, ['ansible_default_ipv4', 'address']) | list }}"
+  roles:
+    - role: ansible-consul
+
+  post_tasks:
+
+    - name: Удаление дефолтного сервиса роли
+      file:
+        path: /etc/consul.d/service_backend.json
+        state: absent
+      notify: Reload Consul
+
+    # Загружаем v1
+
+    - name: Копируем конфиг сервиса backend v1
+      copy:
+        src: consul_services_v1.json
+        dest: /etc/consul.d/backend.json
+        owner: consul
+        group: consul
+        mode: '0644'
+      when: inventory_hostname in ['worker-1', 'backend-v1']
+      notify: Reload Consul
+
+    # Загружаем v2
+    - name: Копируем конфиг сервиса backend v2
+      copy:
+        src: consul_services_v2.json
+        dest: /etc/consul.d/backend.json
+        owner: consul
+        group: consul
+        mode: '0644'
+      when: inventory_hostname in ['worker-2', 'backend-v2']
+      notify: Reload Consul
+
+  handlers:
+    - name: Reload Consul
+      systemd:
+        name: consul
+        state: reloaded

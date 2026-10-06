@@ -1,0 +1,15 @@
+{
+  "service": {
+    "name": "backend",
+    "id": "backend-v2",
+    "port": 80,
+    "tags": ["v2"],
+    "check": {
+      "id": "nginx-v2-check",
+      "name": "HTTP on port 80 check",
+      "http": "http://localhost:80/",
+      "interval": "10s",
+      "timeout": "1s"
+    }
+  }
+}

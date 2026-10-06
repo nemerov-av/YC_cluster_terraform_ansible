@@ -1,0 +1,74 @@
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 2000
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
+
+# ==============================================================================
+# 1. Проксирование Consul UI (порт 8500 -> 8500)
+# ==============================================================================
+frontend consul_ui_frontend
+    bind *:8500
+    mode http
+    default_backend consul_ui_backend
+
+backend consul_ui_backend
+    mode http
+    balance roundrobin
+    option httpchk GET /v1/status/leader
+    {{ range service "consul" }}
+    server {{ .Node }} {{ .Address }}:8500 check
+    {{ else }}
+    server local 127.0.0.1:8500 backup
+    {{ end }}
+
+# ==============================================================================
+# 2. Проксирование Grafana (порт 3000 -> 3000)
+# ==============================================================================
+frontend grafana_frontend
+    bind *:3000
+    mode http
+    default_backend grafana_backend
+
+backend grafana_backend
+    mode http
+    balance roundrobin
+    option httpchk GET /api/health
+    {{ range service "grafana" }}
+    server {{ .Node }} {{ .Address }}:3000 check
+    {{ else }}
+    server local 127.0.0.1:3000 backup
+    {{ end }}
+
+# ==============================================================================
+# Проксирование трафика на приложение (Воркеры)
+# ==============================================================================
+frontend app_frontend
+    bind *:80   # Порт для внешних запросов к приложению
+    mode http
+    default_backend app_backend
+
+backend app_backend
+    mode http
+    balance roundrobin
+    # Consul Template найдет все активные сервисы с именем "my-app"
+    {{ range service "my-app" }}
+    server {{ .Node }} {{ .Address }}:{{ .Port }} check
+    {{ else }}
+    server local 127.0.0.1:8080 backup
+    {{ end }}
+
+    # Экспорт метрик HAProxy для Prometheus (порт 8404)
+frontend prometheus_metrics
+    bind *:8404
+    mode http
+    http-request use-service prometheus-exporter if { path /metrics }
+    no log

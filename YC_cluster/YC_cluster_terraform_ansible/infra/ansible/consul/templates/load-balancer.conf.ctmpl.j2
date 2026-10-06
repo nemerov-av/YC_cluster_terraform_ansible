@@ -1,0 +1,38 @@
+{% raw %}
+# Динамический upstream на основе версии из Consul KV
+{{ $version := keyOrDefault "version" "v2" }}
+
+# Проверка валидности
+{{ if not (or (eq $version "v1") (eq $version "v2")) }}
+  {{ $version = "v2" }}
+{{ end }}
+
+upstream be_version_{{ $version }} {
+{{ range service "backend" "any" }}
+  {{ if .Tags | contains $version }}
+  server {{ .Address }}:{{ .Port }} max_fails=3 fail_timeout=10s;
+  {{ end }}
+{{ else }}
+  server 127.0.0.1:8080 down;
+{{ end }}
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://be_version_{{ $version }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /{{ $version }}/ {
+        proxy_pass http://be_version_{{ $version }}/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+{% endraw %}

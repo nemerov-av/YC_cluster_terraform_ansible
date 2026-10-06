@@ -1,0 +1,83 @@
+---
+- name: Настройка балансировщика Nginx и Consul-Template
+  hosts: load_balancers
+  become: true
+  tasks:
+    - name: Установка Nginx и пакета unzip
+      apt:
+        name:
+          - nginx
+          - unzip
+        state: present
+        update_cache: yes
+
+    - name: Распаковка и копирование consul-template с управляющей машины на LB
+      unarchive:
+        src: files/consul-template.zip
+        dest: /usr/bin
+        remote_src: false
+        mode: '0755'
+
+    - name: Получение значения ключа version из Consul KV
+      community.general.consul_kv:
+        host: 127.0.0.1
+        port: 8500
+        key: version
+      register: kv_version
+      ignore_errors: true
+
+    - name: Валидация и установка переменной active_version
+      set_fact:
+        active_version: >-
+          {%- if kv_version.value is defined and kv_version.value in ['v1', 'v2'] -%}
+            {{ kv_version.value }}
+          {%- else -%}
+            v2
+          {%- endif -%}
+
+    - name: Вывод выбранной версии
+      debug:
+        msg: "Используется версия сервиса: {{ active_version }}"
+
+    - name: Создание каталогов для consul-template
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/consul-template
+        - /etc/consul-template/templates
+
+    - name: Деплой шаблона Nginx (.ctmpl)
+      template:
+        src: templates/load-balancer.conf.ctmpl.j2
+        dest: /etc/consul-template/templates/load-balancer.conf.ctmpl
+
+    - name: Деплой конфигурации consul-template
+      template:
+        src: templates/consul-template.hcl.j2
+        dest: /etc/consul-template/consul-template.hcl
+
+    - name: Создание Systemd Unit для consul-template
+      copy:
+        dest: /etc/systemd/system/consul-template.service
+        content: |
+          [Unit]
+          Description=Consul Template Service
+          After=network.target consul.service
+          Requires=consul.service
+
+          [Service]
+          ExecStart=/usr/bin/consul-template -config=/etc/consul-template/consul-template.hcl
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Запуск и включение автозагрузки consul-template
+      systemd:
+        name: consul-template
+        enabled: yes
+        state: restarted
+        daemon_reload: yes

@@ -1,0 +1,136 @@
+---
+# 1. Базовая подготовка всех узлов
+- name: Подготовка хостов (установка пакетов и acl)
+  hosts: all
+  become: true
+  tasks:
+    - name: Установка acl и зависимостей
+      apt:
+        name:
+          - acl
+          - python3-pip
+          - python3-consul
+          - curl
+          - software-properties-common
+          - unzip
+          - haproxy
+        state: present
+        update_cache: yes
+
+    - name: Удаление старого конфликтного файла конфигурации
+      file:
+        path: /etc/consul/config.json
+        state: absent
+
+
+# 2. Развертывание HA-кластера Consul (Control-Plane Серверы)
+- name: Развертывание HA-кластера Consul (Серверы)
+  hosts: consul_servers
+  become: true
+  vars:
+    consul_group_name: "consul_servers"
+    consul_node_role: "server"
+    consul_bootstrap_expect: 3
+    consul_datacenter: "dc1"
+    consul_bind_address: "{{ ansible_default_ipv4.address }}"
+    consul_encrypt_enable: true
+    consul_raw_key: "cijVdvz5f1bNy4RiR66WkgWYaN/KOVYw8x6NBXomHbg="
+    consul_addresses:
+      dns: "0.0.0.0"
+      http: "0.0.0.0"
+      https: "0.0.0.0"
+      grpc: "0.0.0.0"
+
+  roles:
+    - role: ansible-consul
+
+# 3. Развертывание Consul-клиентов (Включая HAProxy и Worker-ноды)
+- name: Развертывание Consul Клиентов (Backends и LB)
+  hosts: consul_clients:load_balancers
+  become: true
+  gather_facts: true
+  vars:
+    consul_group_name: "consul_servers"
+    consul_node_role: "client"
+    consul_datacenter: "dc1"
+    consul_bind_address: "{{ ansible_default_ipv4.address }}"
+    consul_encrypt_enable: true
+    consul_raw_key: "cijVdvz5f1bNy4RiR66WkgWYaN/KOVYw8x6NBXomHbg="
+    consul_join: "{{ groups['consul_servers'] | map('extract', hostvars, ['ansible_default_ipv4', 'address']) | list }}"
+  roles:
+    - role: ansible-consul
+
+  post_tasks:
+    - name: Удаление дефолтного сервиса роли
+      file:
+        path: /etc/consul.d/service_backend.json
+        state: absent
+      notify: Reload Consul
+
+  handlers:
+    - name: Reload Consul
+      service:
+        name: consul
+        state: reloaded
+
+# 4. Настройка связки HAProxy + Consul-Template на балансировщиках
+- name: Настройка динамического HAProxy через Consul-Template
+  hosts: load_balancers
+  become: true
+  tasks:
+
+    - name: Копирование архива consul-template с локальной машины
+      copy:
+        src: ./files/consul-template_0.42.1_linux_amd64.zip
+        dest: /tmp/consul-template.zip
+        mode: '0644'
+
+    - name: Распаковка consul-template
+      unarchive:
+        src: /tmp/consul-template.zip
+        dest: /usr/local/bin/
+        remote_src: yes
+        mode: '0755'
+    - name: Создание директории для шаблонов
+      file:
+        path: /etc/consul-template
+        state: directory
+        mode: "0755"
+
+    - name: Копирование шаблона haproxy.ctmpl
+      copy:
+        src: haproxy.ctmpl
+        dest: /etc/consul-template/haproxy.ctmpl
+        mode: "0644"
+      notify: Restart Consul-Template
+
+    - name: Создание systemd-сервиса consul-template
+      copy:
+        dest: /etc/systemd/system/consul-template.service
+        content: |
+          [Unit]
+          Description=Consul Template Service for HAProxy
+          After=network.target consul.service
+          Wants=consul.service
+
+          [Service]
+          ExecStart=/usr/local/bin/consul-template -consul-addr 127.0.0.1:8500 -template "/etc/consul-template/haproxy.ctmpl:/etc/haproxy/haproxy.cfg:systemctl restart haproxy"
+          Restart=always
+          User=root
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Consul-Template
+
+    - name: Включение и запуск службы consul-template
+      systemd:
+        name: consul-template
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+  handlers:
+    - name: Restart Consul-Template
+      systemd:
+        name: consul-template
+        state: restarted

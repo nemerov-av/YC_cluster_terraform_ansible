@@ -1,0 +1,13 @@
+# consul_services.yml
+consul_services:
+  - name: "backend"
+    id: "backend-v1"
+    tags:
+      - "v1"
+    port: 80
+    checks:
+      - id: "nginx-http-check"
+        name: "HTTP on port 80"
+        http: "http://localhost:80/"
+        interval: "10s"
+        timeout: "1s"
